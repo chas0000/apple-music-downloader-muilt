@@ -4,12 +4,17 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/spf13/pflag"
 	"main/internal/api"
@@ -30,6 +35,314 @@ func printJSONError(message string) {
 		Message: message,
 	})
 	fmt.Println(string(errJSON))
+}
+
+type LogEntry struct {
+	Content string `json:"content"`
+	Time    string `json:"time"`
+}
+
+type jsonStatus struct {
+	Status    string `json:"status"`
+	TrackNum  int    `json:"trackNum"`
+	TrackName string `json:"trackName"`
+	AlbumName string `json:"albumName"`
+	AlbumID   string `json:"albumId"`
+	Percentage int   `json:"percentage"`
+	Speed     string `json:"speed"`
+	Message   string `json:"message"`
+	TaskLine  int    `json:"taskLine"`
+}
+
+var (
+	logHistory      []LogEntry
+	logMutex        sync.Mutex
+	serverMode      bool
+	port            int
+	progressActive  bool
+	progressLabel   string
+	taskLineMap     map[string]int = make(map[string]int)
+	taskLineMutex   sync.Mutex
+	nextTaskLine    int = 0
+)
+
+func getTaskLineID(status *jsonStatus) string {
+	return fmt.Sprintf("%s-%d", status.AlbumID, status.TrackNum)
+}
+
+func allocateTaskLine(status *jsonStatus) int {
+	taskLineID := getTaskLineID(status)
+	taskLineMutex.Lock()
+	defer taskLineMutex.Unlock()
+
+	if line, exists := taskLineMap[taskLineID]; exists {
+		return line
+	}
+
+	line := nextTaskLine
+	taskLineMap[taskLineID] = line
+	nextTaskLine++
+	return line
+}
+
+func renderProgressLine(status *jsonStatus) {
+	label := status.TrackName
+	if label == "" {
+		label = status.AlbumName
+	}
+	if label == "" {
+		label = "下载任务"
+	}
+
+	statusText := strings.ToLower(status.Status)
+	percent := status.Percentage
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+
+	barWidth := 30
+	filled := int(float64(barWidth) * float64(percent) / 100.0)
+	empty := barWidth - filled
+	bar := strings.Repeat("=", filled) + strings.Repeat("-", empty)
+	message := ""
+	if status.Speed != "" {
+		message += status.Speed
+	}
+	if status.Message != "" {
+		if message != "" {
+			message += " "
+		}
+		message += status.Message
+	}
+	if message == "" {
+		message = "processing"
+	}
+
+	// 为任务分配行号
+	taskLine := allocateTaskLine(status)
+
+	if statusText == "complete" || statusText == "error" {
+		fmt.Printf("[%s] %3d%%  %s %s\n", bar, percent, label, message)
+		taskLineMutex.Lock()
+		delete(taskLineMap, getTaskLineID(status))
+		taskLineMutex.Unlock()
+		progressActive = false
+		return
+	}
+
+	// 在服务器模式下禁用ANSI控制码，直接输出到新行
+	if serverMode {
+		fmt.Printf("[%s] %3d%%  %s %s\n", bar, percent, label, message)
+		progressActive = true
+		return
+	}
+
+	// CLI模式下，多线程时使用ANSI光标控制将进度显示在不同行
+	if taskLine > 0 {
+		fmt.Printf("\033[s\033[%dB\r[%s] %3d%%  %s %s\033[u", taskLine, bar, percent, label, message)
+	} else {
+		fmt.Printf("\r[%s] %3d%%  %s %s", bar, percent, label, message)
+	}
+	progressActive = true
+	progressLabel = label
+}
+
+func tryParseProgress(content string) *jsonStatus {
+	var status jsonStatus
+	if err := json.Unmarshal([]byte(content), &status); err != nil {
+		return nil
+	}
+	if status.Status == "" {
+		return nil
+	}
+	return &status
+}
+
+func broadcast(content string) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return
+	}
+
+	entry := LogEntry{
+		Content: content,
+		Time:    time.Now().Format("15:04:05"),
+	}
+
+	logMutex.Lock()
+	logHistory = append(logHistory, entry)
+	if len(logHistory) > 500 {
+		logHistory = logHistory[len(logHistory)-500:]
+	}
+	logMutex.Unlock()
+
+	if status := tryParseProgress(entry.Content); status != nil {
+		if !jsonOutput {
+			renderProgressLine(status)
+		}
+	} else {
+		if progressActive {
+			fmt.Println()
+			progressActive = false
+		}
+		if !jsonOutput {
+			log.Printf("[LOG] %s", entry.Content)
+		}
+	}
+}
+
+
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+
+
+func logsHandler(w http.ResponseWriter, r *http.Request) {
+	lastIndex := 0
+	if query := r.URL.Query().Get("lastIndex"); query != "" {
+		if i, err := strconv.Atoi(query); err == nil {
+			lastIndex = i
+		}
+	}
+
+	logMutex.Lock()
+	defer logMutex.Unlock()
+
+	if lastIndex < 0 {
+		lastIndex = 0
+	}
+	if lastIndex > len(logHistory) {
+		lastIndex = len(logHistory)
+	}
+
+	resp := map[string]interface{}{
+		"logs":      logHistory[lastIndex:],
+		"nextIndex": len(logHistory),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func processOutput(reader io.Reader) {
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		line := scanner.Text()
+		line = strings.ReplaceAll(line, "\r", "\n")
+		for _, part := range strings.Split(line, "\n") {
+			clean := strings.TrimSpace(part)
+			if clean != "" {
+				broadcast(clean)
+			}
+		}
+	}
+}
+
+func startHTTPServer() error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	exePath, _ = filepath.EvalSymlinks(exePath)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/logs", logsHandler)
+	mux.HandleFunc("/api/download", downloadHandler)
+	
+	log.Printf("===========================================")
+	log.Printf("  Apple Music 后端服务")
+	log.Printf("  下载器 (本地): %s", exePath)
+	log.Printf("  服务端口：%d", port)
+	log.Printf("===========================================")
+
+	if _, err := os.Stat(exePath); err != nil {
+		log.Printf("[致命错误] 找不到下载器: %s", exePath)
+	}
+
+	return http.ListenAndServe(fmt.Sprintf(":%d", port), corsMiddleware(mux))
+}
+
+func downloadHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	type requestBody struct {
+		Url string `json:"url"`
+	}
+
+	var req requestBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "无效的请求体", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Url) == "" {
+		http.Error(w, "缺少 url 字段", http.StatusBadRequest)
+		return
+	}
+
+	broadcast(">>> [PTY模式] 启动任务...")
+
+	exePath, err := os.Executable()
+	if err != nil {
+		http.Error(w, "内部错误: 无法获取可执行文件路径", http.StatusInternalServerError)
+		return
+	}
+
+	workingDir, err := os.Getwd()
+	if err != nil {
+		http.Error(w, "内部错误: 无法获取当前工作目录", http.StatusInternalServerError)
+		return
+	}
+
+	cmd := exec.Command(exePath, "--json-output", req.Url)
+	cmd.Env = os.Environ()
+	cmd.Dir = workingDir
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		http.Error(w, "内部错误: 无法读取 stdout", http.StatusInternalServerError)
+		return
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		http.Error(w, "内部错误: 无法读取 stderr", http.StatusInternalServerError)
+		return
+	}
+
+	if err := cmd.Start(); err != nil {
+		http.Error(w, "内部错误: 无法启动下载进程", http.StatusInternalServerError)
+		return
+	}
+
+	go processOutput(stdout)
+	go processOutput(stderr)
+
+	go func() {
+		err := cmd.Wait()
+		if err != nil {
+			broadcast(fmt.Sprintf(">>> 进程已安全退出 (错误: %v)", err))
+			return
+		}
+		broadcast(">>> 进程已安全退出 (代码: 0)")
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "started"})
 }
 
 func handleSingleMV(urlRaw string) {
@@ -220,7 +533,7 @@ func processURL(urlRaw string, wg *sync.WaitGroup, semaphore chan struct{}, curr
 		return
 	}
 	var urlArg_i = parse.Query().Get("i")
-	err = downloader.Rip(albumId, storefront, urlArg_i, urlRaw, jsonOutput)
+	err = downloader.Rip(albumId, storefront, urlArg_i, urlRaw, true)
 
 	if err != nil {
 		errMsg := fmt.Sprintf("专辑下载失败: %s -> %v", urlRaw, err)
@@ -318,6 +631,8 @@ func runDownloads(initialUrls []string, isBatch bool) {
 func main() {
 	core.InitFlags()
 	pflag.BoolVar(&jsonOutput, "json-output", false, "启用JSON输出 (供给桌面App使用)")
+	pflag.BoolVar(&serverMode, "server", false, "以 HTTP 服务模式启动")
+	pflag.IntVar(&port, "port", 3000, "HTTP 服务端口")
 
 	pflag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "用法: %s [选项] [url1 url2 ...]\n", os.Args[0])
@@ -327,6 +642,13 @@ func main() {
 	}
 
 	pflag.Parse()
+
+	if serverMode {
+		if err := startHTTPServer(); err != nil {
+			log.Fatalf("HTTP 服务启动失败: %v", err)
+		}
+		return
+	}
 
 	err := core.LoadConfig(core.ConfigPath)
 	if err != nil {
