@@ -282,7 +282,8 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type requestBody struct {
-		Url string `json:"url"`
+		Url       string `json:"url"`
+		ExtraArgs string `json:"extraArgs"`
 	}
 
 	var req requestBody
@@ -309,7 +310,14 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cmd := exec.Command(exePath, "--json-output", req.Url)
+	// 构建命令参数
+	cmdArgs := []string{"--json-output"}
+	if strings.TrimSpace(req.ExtraArgs) != "" {
+		cmdArgs = append(cmdArgs, req.ExtraArgs)
+	}
+	cmdArgs = append(cmdArgs, req.Url)
+	
+	cmd := exec.Command(exePath, cmdArgs...)
 	cmd.Env = os.Environ()
 	cmd.Dir = workingDir
 
@@ -533,7 +541,7 @@ func processURL(urlRaw string, wg *sync.WaitGroup, semaphore chan struct{}, curr
 		return
 	}
 	var urlArg_i = parse.Query().Get("i")
-	err = downloader.Rip(albumId, storefront, urlArg_i, urlRaw, true)
+	err = downloader.Rip(albumId, storefront, urlArg_i, urlRaw, jsonOutput)
 
 	if err != nil {
 		errMsg := fmt.Sprintf("专辑下载失败: %s -> %v", urlRaw, err)
