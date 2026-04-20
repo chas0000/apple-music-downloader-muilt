@@ -1120,9 +1120,9 @@ func Rip(albumId string, storefront string, urlArg_i string, urlRaw string, json
 				}()
 
 				trackPath, err := downloadTrackWithFallback(trackData, meta, albumId, storefront, baseSaveFolder, Codec, covPath, qobuzDesc, lyricAccount, workingAccounts, statusIndex, updateStatus, progressChan, jsonOutput, trackIndexInMeta)
-				close(progressChan)
-
+				
 				if err != nil {
+					close(progressChan)
 					core.SharedLock.Lock()
 					core.Counter.Total++
 					errMsg := fmt.Sprintln("下载失败:", err)
@@ -1150,6 +1150,8 @@ func Rip(albumId string, storefront string, urlArg_i string, urlRaw string, json
 						}
 					}
 				}
+
+				close(progressChan)
 
 				if postDownloadError != nil {
 					if jsonOutput {

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/fatih/color"
@@ -35,11 +36,11 @@ type barState struct {
 	trackName  string
 	prefix     string
 	qualityStr string
-	stateTxt   string
-	speedStr   string
-	account    string
-	isDecrypt  bool
-	isDone     bool
+	stateTxt   atomic.Value
+	speedStr   atomic.Value
+	account    atomic.Value
+	isDecrypt  atomic.Bool
+	isDone     atomic.Bool
 	statusMu   sync.Mutex
 }
 
@@ -90,11 +91,12 @@ func (pui *ProgressUI) AddTrack(trackIndex, totalTracks int, trackName, qualityS
 		trackName:  shortName,
 		prefix:     prefix,
 		qualityStr: qualityStr,
-		stateTxt:   "准备中",
-		speedStr:   "- MB/s",
-		account:    "",
-		isDone:     false,
 	}
+	bs.stateTxt.Store("准备中")
+	bs.speedStr.Store("- MB/s")
+	bs.account.Store("")
+	bs.isDone.Store(false)
+	bs.isDecrypt.Store(false)
 
 	red := color.New(color.FgRed).SprintFunc()
 	green := color.New(color.FgGreen).SprintFunc()
@@ -105,22 +107,15 @@ func (pui *ProgressUI) AddTrack(trackIndex, totalTracks int, trackName, qualityS
 		nil,
 		mpb.PrependDecorators(
 			decor.Any(func(s decor.Statistics) string {
-				bs.statusMu.Lock()
-				defer bs.statusMu.Unlock()
 				return bs.prefix
 			}),
 			decor.Any(func(s decor.Statistics) string {
-				bs.statusMu.Lock()
-				defer bs.statusMu.Unlock()
 				return " " + bs.qualityStr
 			}, decor.WC{W: len(qualityStr) + 1}),
 		),
 		mpb.AppendDecorators(
 			decor.Any(func(s decor.Statistics) string {
-				bs.statusMu.Lock()
-				defer bs.statusMu.Unlock()
-
-				speed := bs.speedStr
+				speed := bs.speedStr.Load().(string)
 				if speed == "" {
 					speed = "- MB/s"
 				}
@@ -130,8 +125,8 @@ func (pui *ProgressUI) AddTrack(trackIndex, totalTracks int, trackName, qualityS
 					p = s.Current * 100 / s.Total
 				}
 
-				state := bs.stateTxt
-				acc := bs.account
+				state := bs.stateTxt.Load().(string)
+				acc := bs.account.Load().(string)
 
 				var statusStr string
 				fullState := state
@@ -145,7 +140,7 @@ func (pui *ProgressUI) AddTrack(trackIndex, totalTracks int, trackName, qualityS
 					statusStr = yellow(fullState)
 				} else if strings.Contains(state, "完成") || strings.Contains(state, "已存在") {
 					statusStr = green(fullState)
-				} else if bs.isDecrypt || strings.Contains(state, "解密") || strings.Contains(state, "封装") || strings.Contains(state, "处理") || strings.Contains(state, "失败") || strings.Contains(state, "写入") {
+				} else if bs.isDecrypt.Load() || strings.Contains(state, "解密") || strings.Contains(state, "封装") || strings.Contains(state, "处理") || strings.Contains(state, "失败") || strings.Contains(state, "写入") {
 					statusStr = red(fullState)
 				} else {
 					statusStr = yellow(fullState)
@@ -176,14 +171,12 @@ func (pui *ProgressUI) UpdateStatus(trackIndex int, newStatus string) {
 	pui.mu.Unlock()
 
 	if ok {
-		bs.statusMu.Lock()
-		defer bs.statusMu.Unlock()
-		if bs.isDone {
+		if bs.isDone.Load() {
 			return
 		}
-		bs.stateTxt = newStatus
+		bs.stateTxt.Store(newStatus)
 		if strings.Contains(newStatus, "解密") || strings.Contains(newStatus, "封装") || strings.Contains(newStatus, "处理") || strings.Contains(newStatus, "写入") {
-			bs.isDecrypt = true
+			bs.isDecrypt.Store(true)
 		}
 	}
 }
@@ -194,14 +187,10 @@ func (pui *ProgressUI) UpdateProgress(trackIndex int, percentage int, speedBPS f
 	pui.mu.Unlock()
 
 	if ok {
-		bs.statusMu.Lock()
-		if bs.isDone {
-			bs.statusMu.Unlock()
+		if bs.isDone.Load() {
 			return
 		}
-		bs.speedStr = utils.FormatSpeed(speedBPS)
-		bs.statusMu.Unlock()
-
+		bs.speedStr.Store(utils.FormatSpeed(speedBPS))
 		bs.bar.SetCurrent(int64(percentage))
 	}
 }
@@ -220,13 +209,12 @@ func (pui *ProgressUI) HandleProgress(trackIndex int, progressChan chan runv14.P
 		var hasStartedDecrypting bool = false
 
 		for p := range progressChan {
-			bs.statusMu.Lock()
-			if bs.isDone {
-				bs.statusMu.Unlock()
+			if bs.isDone.Load() {
 				return
 			}
-			bs.speedStr = utils.FormatSpeed(p.SpeedBPS)
-			bs.account = accountName
+			
+			bs.speedStr.Store(utils.FormatSpeed(p.SpeedBPS))
+			bs.account.Store(accountName)
 
 			if p.Stage == "decrypt" {
 				if !hasStartedDecrypting {
@@ -237,27 +225,26 @@ func (pui *ProgressUI) HandleProgress(trackIndex int, progressChan chan runv14.P
 				bs.bar.SetCurrent(int64(p.Percentage))
 				
 				if p.Percentage >= 100 {
-					bs.stateTxt = "元数据写入中"
+					bs.stateTxt.Store("元数据写入中")
 				} else if p.Percentage == 0 {
-					bs.stateTxt = "账号等待解密中"
+					bs.stateTxt.Store("账号等待解密中")
 				} else {
-					bs.stateTxt = "账号解密中"
+					bs.stateTxt.Store("账号解密中")
 				}
 
-				bs.isDecrypt = true
+				bs.isDecrypt.Store(true)
 			} else {
 				hasStartedDecrypting = false
 				bs.bar.SetTotal(100, false)
 				bs.bar.SetCurrent(int64(p.Percentage))
-				bs.isDecrypt = false
+				bs.isDecrypt.Store(false)
 
 				if p.Percentage >= 100 {
-					bs.stateTxt = "账号等待解密中"
+					bs.stateTxt.Store("账号等待解密中")
 				} else {
-					bs.stateTxt = "下载中"
+					bs.stateTxt.Store("下载中")
 				}
 			}
-			bs.statusMu.Unlock()
 		}
 	}()
 }
@@ -272,11 +259,9 @@ func (pui *ProgressUI) SetDone(trackIndex int, status string) {
 	pui.mu.Unlock()
 
 	if ok {
-		bs.statusMu.Lock()
-		bs.stateTxt = status
-		bs.isDone = true
-		bs.speedStr = ""
-		bs.statusMu.Unlock()
+		bs.stateTxt.Store(status)
+		bs.isDone.Store(true)
+		bs.speedStr.Store("")
 
 		bs.bar.SetTotal(100, true)
 		bs.bar.SetCurrent(100)
@@ -293,11 +278,9 @@ func (pui *ProgressUI) Abort(trackIndex int, status string) {
 	pui.mu.Unlock()
 
 	if ok {
-		bs.statusMu.Lock()
-		bs.stateTxt = "失败: " + truncateString(status, 15)
-		bs.isDone = true
-		bs.speedStr = ""
-		bs.statusMu.Unlock()
+		bs.stateTxt.Store("失败: " + truncateString(status, 15))
+		bs.isDone.Store(true)
+		bs.speedStr.Store("")
 
 		bs.bar.SetTotal(100, true)
 	}
